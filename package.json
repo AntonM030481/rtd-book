@@ -1,0 +1,19 @@
+{
+  "name": "rtd-book",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local RTD driving test availability monitor",
+  "engines": {
+    "node": ">=22.16"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test test/*.test.js",
+    "check": "node --check src/cli.js && node --check src/browser.js && node --check src/parser.js && node --check src/monitor.js && node --check src/scan.js"
+  },
+  "dependencies": {
+    "linkedom": "0.18.15",
+    "playwright": "1.65.1"
+  }
+}
