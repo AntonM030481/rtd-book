@@ -58,7 +58,7 @@ export async function scanRange(browser, settings, { signal, onProgress = () => 
       cancelled();
       if (error.code === 'scan_cancelled') throw error;
       const safe = publicError(error);
-      throw new AppError(safe.code, `Range incomplete (${index}/${weeks.length} weeks checked). ${safe.message}`);
+      throw new AppError(safe.code, `Range incomplete (${index}/${weeks.length} weeks checked). ${safe.message}`, safe);
     }
     if (index < weeks.length - 1) {
       try { await delay(settings.scanDelaySeconds * 1000, undefined, { signal }); }

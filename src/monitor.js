@@ -17,6 +17,7 @@ export class Monitor {
     this.lastError = null;
     this.lastAttempt = null;
     this.failures = 0;
+    this.retryNotBefore = 0;
     this.events = [];
     this.notificationSeq = 0;
     this.previous = new Set();
@@ -41,6 +42,25 @@ export class Monitor {
     if (this.busy) throw new AppError('busy', 'Wait for the current operation to finish.');
   }
 
+  assertCooldown() {
+    if (Date.now() < this.retryNotBefore) throw new AppError('cooldown', `Waiting until ${new Date(this.retryNotBefore).toISOString()} (UTC) before the next request.`);
+  }
+
+  scheduleCheck(deadline) {
+    this.nextCheck = new Date(deadline).toISOString();
+    // Node timers overflow above ~24.8 days. Long server deadlines must not
+    // turn into immediate retries; rearm locally without sending requests.
+    const arm = () => {
+      this.timer = setTimeout(() => {
+        if (!this.running) return;
+        if (Date.now() < deadline) arm();
+        else void this.check();
+      }, Math.min(Math.max(0, deadline - Date.now()), 2147483647));
+      this.timer.unref?.();
+    };
+    arm();
+  }
+
   update(settings) {
     this.assertIdle();
     this.stop(false);
@@ -53,6 +73,7 @@ export class Monitor {
 
   async prepare() {
     this.assertIdle();
+    this.assertCooldown();
     this.stop(false);
     this.busy = true;
     try {
@@ -71,6 +92,7 @@ export class Monitor {
 
   async check({ afterWeek = null } = {}) {
     this.assertIdle();
+    this.assertCooldown();
     clearTimeout(this.timer);
     this.nextCheck = null;
     this.busy = true;
@@ -86,6 +108,7 @@ export class Monitor {
       this.result = { ...calendar, matches, checkedAt: new Date().toISOString() };
       this.lastError = null;
       this.failures = 0;
+      this.retryNotBefore = 0;
       const pause = this.running && this.settings.pauseOnMatch && matches.length > 0;
       if (pause) { this.running = false; this.waitingForBooking = true; }
       this.event(pause
@@ -111,7 +134,13 @@ export class Monitor {
       this.event(this.lastError.message, 'error');
       // A stale last result remains visibly stale. Structural/session errors
       // require intervention; transport errors get exponential backoff.
-      if (!['request_failed', 'http_error'].includes(this.lastError.code) || this.failures >= 3) {
+      if (this.lastError.code === 'rate_limited') {
+        const backoff = Math.min(this.settings.intervalSeconds * 2 ** this.failures, 3600) * 1000;
+        this.retryNotBefore = Math.max(Date.now() + backoff, this.lastError.retryAt || 0);
+        this.event(this.running
+          ? `Rate limited. Next attempt at ${new Date(this.retryNotBefore).toISOString()} (UTC); no requests during the wait.`
+          : `Rate limited. Retry no earlier than ${new Date(this.retryNotBefore).toISOString()} (UTC).`, 'warning');
+      } else if (!['request_failed', 'http_error'].includes(this.lastError.code) || this.failures >= 3) {
         this.running = false;
         this.event('Monitoring stopped. Check the RTD window before continuing.', 'warning');
       }
@@ -120,9 +149,7 @@ export class Monitor {
       this.abortController = null;
       if (this.running) {
         const delay = Math.min(this.settings.intervalSeconds * 2 ** this.failures, 3600) * 1000;
-        this.nextCheck = new Date(Date.now() + delay).toISOString();
-        this.timer = setTimeout(() => { void this.check(); }, delay);
-        this.timer.unref?.();
+        this.scheduleCheck(Math.max(Date.now() + delay, this.retryNotBefore));
       }
     }
     return this.snapshot();
@@ -131,6 +158,7 @@ export class Monitor {
   async start() {
     this.assertIdle();
     if (this.running) return this.snapshot();
+    this.assertCooldown();
     this.running = true;
     this.waitingForBooking = false;
     this.failures = 0;
@@ -158,6 +186,7 @@ export class Monitor {
 
   async restart() {
     this.assertIdle();
+    this.assertCooldown();
     this.stop(false);
     this.skippedWeeks.clear();
     this.previous.clear();

@@ -1,7 +1,7 @@
 import { chromium } from 'playwright';
 import { join } from 'node:path';
 import { config, root } from './config.js';
-import { AppError } from './errors.js';
+import { AppError, httpError } from './errors.js';
 import { isoDate, parseCalendar } from './parser.js';
 
 const origin = 'https://rtd.mcw.gov.cy';
@@ -11,8 +11,82 @@ const categoryKey = value => value.split('%')[0].trim().toUpperCase().replaceAll
 export class RtdBrowser {
   context = null;
   page = null;
+  accessError = null;
+  calendarRetry = null;
+  lastAccessResponse = null;
+
+  observeResponse(response) {
+    // Observe existing document traffic only; never issue a diagnostic request.
+    if (!response.request().isNavigationRequest() || new URL(response.url()).origin !== origin) return;
+    if (![401, 403, 429].includes(response.status()) || this.lastAccessResponse === response) return;
+    this.lastAccessResponse = response;
+    if (this.accessError && this.accessError.code !== 'rate_limited') return;
+    this.accessError = httpError(response.status(), response.headers()['retry-after'] || '');
+    this.calendarRetry = null;
+    const request = response.request();
+    // Retain only the rejected read-only calendar request, in memory. Never
+    // replay login, booking, payment, or an unfamiliar endpoint.
+    if (response.status() === 429 && request.method() === 'POST'
+      && new URL(request.url()).pathname === '/WebPhase1/ExaminerDateServlet'
+      && request.headers()['content-type']?.startsWith('application/x-www-form-urlencoded')) {
+      const body = request.postData();
+      const date = isoDate(new URLSearchParams(body).get('asd') || '');
+      if (date) this.calendarRetry = { frame: response.frame(), url: response.url(), body, date };
+    }
+  }
+
+  assertAccess() { if (this.accessError) throw this.accessError; }
+
+  async recoverCalendar() {
+    const error = this.accessError;
+    if (error?.code !== 'rate_limited') { this.assertAccess(); return null; }
+    if (error.retryAt > Date.now()) throw error;
+    const retry = this.calendarRetry;
+    if (!retry || retry.frame.isDetached() || retry.frame.url() !== retry.url) {
+      throw new AppError('manual_step', 'The rate-limited calendar cannot be restored safely. Check the RTD window and restart manually.');
+    }
+    this.accessError = null;
+    this.calendarRetry = null;
+    let response;
+    try {
+      [response] = await Promise.all([
+        retry.frame.waitForNavigation({ waitUntil: 'load', timeout: 20000 }),
+        retry.frame.evaluate(({ url, body }) => {
+          if (location.href !== url) throw new Error('The calendar page changed.');
+          const form = document.createElement('form');
+          form.method = 'post';
+          form.acceptCharset = 'UTF-8';
+          form.action = url;
+          for (const [name, value] of new URLSearchParams(body)) {
+            const input = document.createElement('input');
+            input.type = 'hidden'; input.name = name; input.value = value;
+            form.append(input);
+          }
+          document.body.append(form);
+          HTMLFormElement.prototype.submit.call(form);
+        }, { url: retry.url, body: retry.body }),
+      ]);
+    } catch {
+      this.assertAccess();
+      throw new AppError('manual_step', 'Calendar recovery failed. Check the RTD window and restart manually.');
+    }
+    await this.validateCalendarResponse(response);
+    await this.waitCalendarDate(retry.frame, retry.date);
+    return retry.date;
+  }
+
+  async validateCalendarResponse(response) {
+    if (!response) throw new AppError('week_mismatch', 'The date did not load a new calendar document.');
+    if (new URL(response.url()).origin !== origin) throw new AppError('unexpected_action', 'The calendar navigated outside RTD.');
+    this.observeResponse(response);
+    this.assertAccess();
+    const failure = httpError(response.status(), response.headers()['retry-after'] || '');
+    if (failure) throw failure;
+    if (await this.findFrame('input[type="password"]')) throw new AppError('session_expired', 'The RTD session expired. Restart the app.');
+  }
 
   async open() {
+    this.assertAccess();
     if (!this.context) {
       try {
         this.context = await chromium.launchPersistentContext(join(root, '.local', 'browser'), {
@@ -21,6 +95,7 @@ export class RtdBrowser {
         });
         this.context.on('close', () => { this.context = null; this.page = null; });
         this.context.setDefaultTimeout(12000);
+        this.context.on('response', response => this.observeResponse(response));
       } catch {
         throw new AppError('browser_unavailable', 'Could not open Chrome. Close the previous app browser and check that Chrome is installed.');
       }
@@ -30,11 +105,13 @@ export class RtdBrowser {
       if (!this.page.url().startsWith(origin)) {
         try { await this.page.goto(entry, { waitUntil: 'domcontentloaded', timeout: 30000 }); }
         catch (error) {
+          this.assertAccess();
           const networkCode = /net::[A-Z_]+/.exec(error.message)?.[0];
           throw new AppError('navigation_failed', `Could not load RTD${networkCode ? ` (${networkCode})` : ''}. Check the network and browser window, then restart the app.`);
         }
       }
     }
+    this.assertAccess();
     await this.page.bringToFront();
   }
 
@@ -44,6 +121,7 @@ export class RtdBrowser {
   }
 
   async findFrame(selector) {
+    this.assertAccess();
     for (const frame of this.frames()) {
       try { if (await frame.locator(selector).count()) return frame; } catch { /* frame navigated */ }
     }
@@ -128,7 +206,7 @@ export class RtdBrowser {
       if (await this.findFrame('input[type="password"]')) throw new AppError('session_expired', 'The RTD session expired. Restart the app.');
       throw new AppError('calendar_missing', 'The weekly calendar is missing. Restart the app to prepare it.');
     }
-    const result = await frame.evaluate(async ({ expectedOrigin, centre, category }) => {
+    const result = await frame.evaluate(({ expectedOrigin, centre, category }) => {
       const form = document.forms.namedItem('vrmSearch');
       if (!form) return { error: 'calendar_missing' };
       const url = new URL(form.action, location.href);
@@ -140,39 +218,29 @@ export class RtdBrowser {
       if (!centres.length || centres.some(value => value !== centre) || !rawCategory || normalize(rawCategory) !== normalize(category)) return { error: 'context_mismatch' };
       const date = form.elements.namedItem('asd')?.value;
       if (!date) return { error: 'date_missing' };
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20000);
-      try {
-        const response = await fetch(url.href, {
-          method: 'POST', body: new URLSearchParams(data), credentials: 'same-origin',
-          redirect: 'follow', cache: 'no-store', signal: controller.signal,
-        });
-        if (new URL(response.url).origin !== expectedOrigin) return { error: 'unexpected_action' };
-        if (/\/Common\/(Login|Redirect)/i.test(new URL(response.url).pathname)) return { error: 'session_expired' };
-        // Keep raw HTML in memory only. It may contain personal form fields.
-        const html = await response.text();
-        return { html, status: response.status, date };
-      } catch { return { error: 'request_failed' }; }
-      finally { clearTimeout(timeout); }
+      // Read one snapshot of the displayed document. Do not fetch a newer,
+      // invisible calendar that could disagree with the page used for booking.
+      // Raw HTML stays in memory because it may contain personal form fields.
+      return { html: document.documentElement.outerHTML, date };
     }, { expectedOrigin: origin, centre: settings.centre, category: settings.category });
     const messages = {
       calendar_missing: 'The calendar form is no longer available. Open it again.',
       unexpected_action: 'The form action or method is not recognized.',
       context_mismatch: 'The calendar centre or category does not match .env. Select the correct values in RTD.',
       date_missing: 'The selected date could not be identified. No request was sent.',
-      request_failed: 'The RTD request failed. Check the connection and browser session.',
-      session_expired: 'RTD redirected to login. Restart the app.',
     };
+    this.assertAccess();
     if (result.error) throw new AppError(result.error, messages[result.error]);
     const expectedDate = isoDate(result.date);
     if (!expectedDate) throw new AppError('date_missing', 'The calendar date was not recognized.');
-    return { ...parseCalendar(result.html, { expectedDate, status: result.status }), centre: settings.centre, category: settings.category };
+    return { ...parseCalendar(result.html, { expectedDate }), centre: settings.centre, category: settings.category };
   }
 
   async selectDate(date) {
     try { return await this.selectCalendarDate(date); }
     catch (error) {
       if (error instanceof AppError) throw error;
+      this.assertAccess();
       // This operation uses only calendar selectors and a date, never credentials.
       throw new AppError('date_selection_failed', `Could not select the calendar date: ${String(error.message).split('\n')[0].slice(0, 180)}`);
     }
@@ -182,6 +250,7 @@ export class RtdBrowser {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isFinite(Date.parse(date)) || new Date(date).toISOString().slice(0, 10) !== date) {
       throw new AppError('invalid_date', 'The date must be a valid YYYY-MM-DD value.');
     }
+    if (this.accessError?.code === 'rate_limited' && await this.recoverCalendar() === date) return;
     const frame = await this.findFrame('form[name="vrmSearch"]');
     if (!frame) throw new AppError('calendar_missing', 'The weekly calendar must be open before selecting a date.');
     const target = new Date(`${date}T00:00:00Z`);
@@ -212,14 +281,23 @@ export class RtdBrowser {
       if (currentMonth === null || currentMonth !== previous + (next ? 1 : -1)) throw new AppError('manual_step', 'The month change was not confirmed. Check the RTD calendar.');
     }
     // The date field changes synchronously, but the site's POST replaces the
-    // frame afterward. Await that navigation even within the same week, or a
-    // subsequent fetch can run in the document that is being destroyed.
+    // frame afterward. Await that navigation even within the same week before
+    // reading the displayed calendar.
+    let response;
     try {
-      await Promise.all([
+      [response] = await Promise.all([
         frame.waitForNavigation({ waitUntil: 'load', timeout: 20000 }),
         frame.getByRole('link', { name: String(target.getUTCDate()), exact: true }).click(),
       ]);
-    } catch { throw new AppError('week_mismatch', 'The date did not load a new calendar document. Check whether RTD allows that date.'); }
+    } catch {
+      this.assertAccess();
+      throw new AppError('week_mismatch', 'The date did not load a new calendar document. Check whether RTD allows that date.');
+    }
+    await this.validateCalendarResponse(response);
+    await this.waitCalendarDate(frame, date);
+  }
+
+  async waitCalendarDate(frame, date) {
     const fullDate = `${date.slice(8, 10)}/${date.slice(5, 7)}/${date.slice(0, 4)}`;
     const shortDate = `${date.slice(8, 10)}/${date.slice(5, 7)}/${date.slice(2, 4)}`;
     try {
