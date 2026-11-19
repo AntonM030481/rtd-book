@@ -74,10 +74,18 @@ export class Monitor {
   async prepare() {
     this.assertIdle();
     this.assertCooldown();
-    this.stop(false);
+    // Keep the manual handoff and its result until preparation succeeds.
+    // A refused return must not make the CLI close the user's browser.
+    this.running = false;
+    clearTimeout(this.timer);
+    this.timer = null;
+    this.nextCheck = null;
     this.busy = true;
+    const controller = this.abortController = new AbortController();
     try {
       const outcome = await this.browser.prepare(this.settings);
+      if (controller.signal.aborted) throw new AppError('scan_cancelled', 'Preparation stopped.');
+      this.waitingForBooking = false;
       this.result = null;
       this.previous.clear();
       this.lastError = null;
@@ -87,7 +95,7 @@ export class Monitor {
       this.lastError = publicError(error);
       this.event(this.lastError.message, 'error');
       throw error;
-    } finally { this.busy = false; }
+    } finally { this.busy = false; this.abortController = null; }
   }
 
   async check({ afterWeek = null } = {}) {
@@ -190,7 +198,12 @@ export class Monitor {
     this.assertIdle();
     this.assertCooldown();
     if (!this.waitingForBooking || !this.result?.matches.length) throw new AppError('not_paused', 'The monitor is not paused on matching slots.');
-    await this.browser.returnToCalendar?.(this.settings);
+    this.busy = true;
+    const controller = this.abortController = new AbortController();
+    try {
+      await this.browser.returnToCalendar?.(this.settings);
+      if (controller.signal.aborted) throw new AppError('scan_cancelled', 'Return to calendar stopped.');
+    } finally { this.busy = false; this.abortController = null; }
     const date = this.result.matches[0].date;
     const week = planWeeks(date, date)[0];
     this.skippedWeeks.add(week.from);
@@ -209,14 +222,11 @@ export class Monitor {
   async restart() {
     this.assertIdle();
     this.assertCooldown();
-    this.stop(false);
-    this.skippedWeeks.clear();
-    this.previous.clear();
-    this.result = null;
-    this.lastError = null;
-    this.failures = 0;
-    this.event('Restarting the full scan. Previously skipped weeks are included again. Settings are unchanged.');
+    this.event('Preparing to restart the full scan. Settings are unchanged.');
     await this.prepare();
+    this.skippedWeeks.clear();
+    this.failures = 0;
+    this.event('Restarting the full scan. Previously skipped weeks are included again.');
     return this.start();
   }
 

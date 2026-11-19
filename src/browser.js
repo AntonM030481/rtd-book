@@ -25,6 +25,10 @@ export class RtdBrowser {
     this.accessError = httpError(response.status(), response.headers()['retry-after'] || '');
     this.calendarRetry = null;
     const request = response.request();
+    if (response.status() === 429 && this.selection && response.frame() === this.selection.frame
+      && response.url() === this.selection.detailUrl && request.method() === 'GET') {
+      this.selection.rateLimitError = this.accessError;
+    }
     // Retain only the rejected read-only calendar request, in memory. Never
     // replay login, booking, payment, or an unfamiliar endpoint.
     if (response.status() === 429 && request.method() === 'POST'
@@ -140,8 +144,8 @@ export class RtdBrowser {
   }
 
   async prepare(settings) {
-    await this.open();
     await this.returnToCalendar(settings);
+    await this.open();
     // A single credential submission per explicit prepare action. Never retry
     // a rejected login in the monitoring loop.
     const passwordFrame = await this.waitForLoginOrAccount();
@@ -376,21 +380,34 @@ export class RtdBrowser {
   async returnToCalendar(settings) {
     if (!this.selection) return;
     const { frame, calendarUrl, detailUrl } = this.selection;
-    this.assertAccess();
     if (frame.isDetached() || ![calendarUrl, detailUrl].includes(frame.url())) {
       throw new AppError('manual_step', 'The page changed after slot selection. Check RTD manually before restarting the monitor.');
     }
-    if (frame.url() === detailUrl) {
-      // Only an explicit next/restart command returns through browser history.
-      // It never resubmits the selection or payment form.
-      await Promise.all([
-        frame.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
-        frame.evaluate(() => history.back()),
-      ]);
+    const previousError = this.accessError;
+    if (previousError?.code === 'rate_limited' && previousError === this.selection.rateLimitError
+      && !(previousError.retryAt > Date.now())) {
+      // Explicit next/restart may leave a rejected selection after cooldown.
+      // Clear only this selection's old 429, never a newer or unrelated error.
+      this.accessError = null;
     }
-    if (frame.url() !== calendarUrl) throw new AppError('manual_step', 'The previous calendar could not be restored. Check the RTD window.');
-    await this.check(settings);
-    this.selection = null;
+    this.assertAccess();
+    try {
+      if (frame.url() === detailUrl) {
+        // Go back only; never replay the selection GET or payment POST.
+        const [response] = await Promise.all([
+          frame.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
+          frame.evaluate(() => history.back()),
+        ]);
+        if (response) await this.validateCalendarResponse(response);
+      }
+      if (frame.url() !== calendarUrl) throw new AppError('manual_step', 'The previous calendar could not be restored. Check the RTD window.');
+      await this.check(settings);
+      this.selection = null;
+    } catch (error) {
+      // Failed recovery keeps the selection and any new access restriction.
+      this.accessError ||= previousError;
+      throw error;
+    }
   }
 
   async focus() { if (this.page && !this.page.isClosed()) await this.page.bringToFront(); }

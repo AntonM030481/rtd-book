@@ -64,12 +64,14 @@ Automation ends on that page. The browser stays open and the monitor sends no fu
 
 If the slot changes, the selection times out, receives an error (including 429), or returns an unfamiliar/mismatching page, the monitor remains paused with the browser open. It never automatically retries selection. Inspect the page before continuing; a server Retry-After still blocks next/restart until its deadline.
 
+After a selection 429 cooldown, an explicit `next` or `restart` can return through browser history, or accept the calendar if you already returned manually. This clears only that selection's old rate-limit error and does not replay its selection GET. A new 401, 403 or unrelated 429 remains blocking. If returning or preparing fails, the monitor preserves the manual pause, previous result and skipped weeks, and leaves the browser open. Quitting during a return/restart prevents scanning from resuming.
+
 While paused, enter a command in the same terminal and press Enter:
 
 | Command | Action |
 |---|---|
 | `next` / `n` | Return from the selection page via browser history, reject this whole week and continue with later weeks. The rejected week is excluded from later cycles until restart. |
-| `restart` / `r` | Clear rejected weeks, prepare the calendar and scan the entire configured range again using the same settings. |
+| `restart` / `r` | Prepare the calendar; after success, clear rejected weeks and scan the entire configured range again using the same settings. |
 | `quit` / `q` | Stop the app and close its browser. Ctrl+C does the same. |
 
 These commands never submit payment or cancel a booking. Resumed watch scans select the next matching slot and stop again. If you have navigated beyond the selection page, automatic return is refused; inspect RTD manually. `restart` does not reread `.env`; exit and launch again to apply edited settings. Do not exit while still using the app browser to finish a booking. If a slot has disappeared since detection, continue searching with `next` or `restart`.

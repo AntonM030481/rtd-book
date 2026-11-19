@@ -188,3 +188,59 @@ test('selection HTTP 429 is not retained for calendar replay', async t => {
   assert.equal(browser.calendarRetry, null);
   assert.equal(requests.filter(r => r.path.endsWith('NewCalendar3.jsp')).length, 1);
 });
+
+for (const command of ['returnToCalendar', 'prepare']) {
+  test(`${command} leaves selection 429 after the deadline without replaying selection`, async t => {
+    const { browser, requests, settings, slot } = await selectionHarness(t, { status: 429 });
+    await assert.rejects(browser.selectSlot(slot, settings), { code: 'rate_limited' });
+    const count = requests.length;
+    await assert.rejects(browser[command](settings), { code: 'rate_limited' });
+    assert.equal(requests.length, count);
+    t.mock.timers.enable({ apis: ['Date'], now: browser.accessError.retryAt + 1 });
+    await browser[command](settings);
+    assert.equal(browser.accessError, null);
+    assert.equal(browser.selection, null);
+    assert.equal((await browser.check(settings)).available, 1);
+    assert.equal(requests.filter(r => r.path.endsWith('NewCalendar3.jsp')).length, 1);
+    assert.equal(requests.some(r => r.method === 'POST'), false);
+  });
+}
+
+test('explicit recovery accepts a calendar already restored manually after selection 429', async t => {
+  const { browser, requests, settings, slot } = await selectionHarness(t, { status: 429 });
+  await assert.rejects(browser.selectSlot(slot, settings), { code: 'rate_limited' });
+  t.mock.timers.enable({ apis: ['Date'], now: browser.accessError.retryAt + 1 });
+  const frame = browser.selection.frame;
+  await frame.goto(observedCalendarUrl);
+  const count = requests.length;
+  await browser.returnToCalendar(settings);
+  assert.equal(browser.selection, null);
+  assert.equal(browser.accessError, null);
+  assert.equal(requests.length, count);
+});
+
+for (const status of [401, 403, 429]) {
+  test(`return cannot clear a newer HTTP ${status} from a different operation`, async t => {
+    const { browser, settings, slot } = await selectionHarness(t, { status: 429 });
+    await assert.rejects(browser.selectSlot(slot, settings), { code: 'rate_limited' });
+    t.mock.timers.enable({ apis: ['Date'], now: browser.accessError.retryAt + 1 });
+    await browser.context.route(observedCalendarUrl, route => route.fulfill({ status, body: 'Access error' }));
+    await browser.selection.frame.goto(observedCalendarUrl);
+    const latestError = browser.accessError;
+    await assert.rejects(browser.returnToCalendar(settings), { code: latestError.code });
+    assert.equal(browser.accessError, latestError);
+    assert.ok(browser.selection);
+  });
+}
+
+test('return refuses a page beyond selection and retains manual inspection state', async t => {
+  const { browser, settings, slot } = await selectionHarness(t);
+  await browser.selectSlot(slot, settings);
+  const selection = browser.selection;
+  await browser.context.route(`${origin}/manual-payment`, route => route.fulfill({ body: 'Manual payment page' }));
+  await selection.frame.goto(`${origin}/manual-payment`);
+  await assert.rejects(browser.prepare(settings), { code: 'manual_step' });
+  assert.equal(browser.selection, selection);
+  assert.equal(selection.frame.url(), `${origin}/manual-payment`);
+  assert.equal(browser.page.isClosed(), false);
+});

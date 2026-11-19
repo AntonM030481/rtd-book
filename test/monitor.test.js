@@ -170,3 +170,43 @@ test('stop during handoff prevents both a success report and further work', asyn
   assert.equal(monitor.waitingForBooking, false);assert.equal(monitor.running, false);assert.equal(monitor.nextCheck, null);
   assert.notEqual(monitor.result.handoff.status, 'ready');
 });
+
+test('refused restart preserves the manual handoff, results and skipped weeks', async () => {
+  const monitor = new Monitor({ prepare: async () => { throw new AppError('manual_step', 'Cannot leave payment.'); } }, settings);
+  const previous = { matches: [slot], handoff: { status: 'ready' } };
+  monitor.waitingForBooking = true;
+  monitor.result = previous;
+  monitor.previous.add('known-slot');
+  monitor.skippedWeeks.add('2026-11-30');
+  await assert.rejects(monitor.restart(), { code: 'manual_step' });
+  assert.equal(monitor.waitingForBooking, true);
+  assert.equal(monitor.running, false);
+  assert.equal(monitor.busy, false);
+  assert.equal(monitor.nextCheck, null);
+  assert.equal(monitor.result, previous);
+  assert.ok(monitor.previous.has('known-slot'));
+  assert.ok(monitor.skippedWeeks.has('2026-11-30'));
+  assert.equal(monitor.lastError.code, 'manual_step');
+});
+
+for (const command of ['restart', 'continueAfterMatch']) {
+  test(`stop during ${command} cannot resume scanning or restore a cancelled pause`, async () => {
+    let finish, reached;
+    const ready = new Promise(resolve => { reached = resolve; });
+    const restore = async () => { reached(); await new Promise(resolve => { finish = resolve; }); return { message: 'Ready' }; };
+    const monitor = new Monitor({ prepare: restore, returnToCalendar: restore,
+      selectDate: async () => assert.fail('Must not resume after stop'),
+    }, settings);
+    monitor.waitingForBooking = true;
+    monitor.result = { matches: [slot] };
+    const pending = monitor[command]();
+    await ready;
+    await assert.rejects(monitor.check(), { code: 'busy' });
+    monitor.stop(false);
+    finish();
+    await assert.rejects(pending, { code: 'scan_cancelled' });
+    assert.equal(monitor.running, false);
+    assert.equal(monitor.waitingForBooking, false);
+    assert.equal(monitor.nextCheck, null);
+  });
+}
