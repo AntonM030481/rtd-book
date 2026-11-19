@@ -100,7 +100,8 @@ export class Monitor {
     this.abortController = new AbortController();
     try {
       const calendar = await scanRange(this.browser, this.settings, { signal: this.abortController.signal, onProgress: message => this.event(message), pauseOnMatch: this.running && this.settings.pauseOnMatch, skippedWeeks: this.skippedWeeks, afterWeek });
-      const matches = filterSlots(calendar.slots, this.settings);
+      const matches = filterSlots(calendar.slots, this.settings)
+        .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
       const keys = new Set(matches.map(slot => `${calendar.centre}|${calendar.category}|${slot.date}|${slot.time}`));
       const fresh = [...keys].filter(key => !this.previous.has(key));
       if (fresh.length) this.notificationSeq++;
@@ -116,13 +117,32 @@ export class Monitor {
         : calendar.status === 'partial'
         ? `Partial result: ${calendar.unknown} unknown cells.`
         : `${afterWeek ? 'Remaining weeks' : 'Range'} checked. Matching slots: ${matches.length}.`, calendar.status === 'partial' ? 'warning' : 'info');
-      this.onResult(this.result, fresh.length);
       if (pause) {
+        const selected = matches[0];
+        this.result.handoff = { status: 'opening', slot: selected };
+        this.event(`Opening ${selected.date} ${selected.time}${selected.overtime ? ' (overtime)' : ''}. CAPTCHA and payment will be left to you.`);
+        try {
+          await this.browser.selectSlot(selected, this.settings, { signal: this.abortController.signal });
+          if (this.abortController.signal.aborted) throw new AppError('scan_cancelled', 'Selection stopped.');
+          this.result.handoff.status = 'ready';
+          this.event('Selected exam confirmed on the CAPTCHA/payment page. Automation is complete; continue manually. This is not a booking confirmation.');
+        } catch (error) {
+          if (this.abortController.signal.aborted) throw new AppError('scan_cancelled', 'Selection stopped.');
+          this.lastError = publicError(error);
+          this.result.handoff = { status: 'failed', slot: selected, error: this.lastError };
+          // A selection may already have reached RTD. Never automatically retry
+          // it, including after HTTP 429, a timeout or an unfamiliar response.
+          this.retryNotBefore = Math.max(this.retryNotBefore, this.lastError.retryAt || 0,
+            this.lastError.code === 'rate_limited' ? Date.now() + this.settings.intervalSeconds * 2000 : 0);
+          this.event(`Slot selection was not confirmed. ${this.lastError.message}`, 'error');
+          this.event('Monitoring remains paused. Inspect the browser; no selection or payment request will be retried.', 'warning');
+        }
         try { await this.browser.focus?.(); }
         catch { this.event('Could not bring RTD to the front. Switch to the app browser manually.', 'warning'); }
-        this.event('The RTD browser stays on this week for manual booking. No further scans will run until you continue.');
+        this.event('The RTD browser stays open. No further automated actions will run until you continue.');
         this.event('Paused: next/n skips this week; restart/r restarts the full scan; quit/q closes the app browser.');
       }
+      this.onResult(this.result, fresh.length);
     } catch (error) {
       if (error.code === 'scan_cancelled') {
         this.lastError = publicError(error);
@@ -168,7 +188,9 @@ export class Monitor {
 
   async continueAfterMatch() {
     this.assertIdle();
+    this.assertCooldown();
     if (!this.waitingForBooking || !this.result?.matches.length) throw new AppError('not_paused', 'The monitor is not paused on matching slots.');
+    await this.browser.returnToCalendar?.(this.settings);
     const date = this.result.matches[0].date;
     const week = planWeeks(date, date)[0];
     this.skippedWeeks.add(week.from);

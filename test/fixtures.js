@@ -14,3 +14,12 @@ export function calendar({ backgrounds = {}, headers = dates, omit = null } = {}
       }).join('')}</tr>`).join('')}
     </table></td></tr></table></form></body></html>`;
 }
+
+// Sanitized structure observed live for both regular and overtime slots.
+export function observedCalendar(background = 'bluetimeover.gif') {
+  const href = 'NewCalendar3.jsp?examtime=13:45+&amp;nameDay=3&amp;calendarday=04/12/26&amp;h_centre=1&amp;licencecategory=ΒΒ&amp;lang=null';
+  return calendar({ backgrounds: { '7:4': background } })
+    .replace('<table>', '<input type="hidden" name="licencecategory" value="ΒΒ"><table>')
+    .replace(`<td background="/WebPhase1/images/drivercalendar/${background}"><h5>13:45</h5></td>`,
+      `<td background="/WebPhase1/images/drivercalendar/${background}"><a href="${href}" target="center"><h5>13:45</h5></a></td>`);
+}

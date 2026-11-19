@@ -25,7 +25,7 @@ test('plan every week exactly once across month/year boundaries; skip Sunday-onl
 test('serial scan checks each week, removes dates outside bounds and reports full coverage', async () => {
   let target;
   const operations = [];
-  const browser = { selectDate: async date => { target = date; operations.push(`select:${date}`); }, check: async () => { operations.push(`check:${target}`); return fakeCalendar(target); } };
+  const browser = { selectSlot: async () => {}, selectDate: async date => { target = date; operations.push(`select:${date}`); }, check: async () => { operations.push(`check:${target}`); return fakeCalendar(target); } };
   const result = await scanRange(browser, settings, { delay: async () => operations.push('delay') });
   assert.deepEqual(operations, ['select:2026-12-05', 'check:2026-12-05', 'delay', 'select:2026-12-12', 'check:2026-12-12']);
   assert.equal(result.weeksChecked, 2); assert.equal(result.slots.length, 7);
@@ -34,13 +34,13 @@ test('serial scan checks each week, removes dates outside bounds and reports ful
 });
 
 test('a repeated stale week is not treated as complete range', async () => {
-  const browser = { selectDate: async () => {}, check: async () => fakeCalendar('2026-12-05') };
+  const browser = { selectSlot: async () => {}, selectDate: async () => {}, check: async () => fakeCalendar('2026-12-05') };
   await assert.rejects(scanRange(browser, settings, { delay: async () => {} }), { code: 'week_mismatch', message: /Range incomplete \(1\/2 weeks checked\)/ });
 });
 
 test('unknown cells remain partial even when all weeks load', async () => {
   let target;
-  const browser = { selectDate: async date => { target = date; }, check: async () => { const value = fakeCalendar(target); value.slots[5].availability = 'unknown'; return value; } };
+  const browser = { selectSlot: async () => {}, selectDate: async date => { target = date; }, check: async () => { const value = fakeCalendar(target); value.slots[5].availability = 'unknown'; return value; } };
   const result = await scanRange(browser, settings, { delay: async () => {} });
   assert.equal(result.status, 'partial'); assert.equal(result.unknown, 1);
 });
@@ -48,13 +48,13 @@ test('unknown cells remain partial even when all weeks load', async () => {
 test('cancel between weeks prevents further navigation and rejects incomplete scan', async () => {
   const controller = new AbortController();
   let selected = 0;
-  const browser = { selectDate: async () => { selected++; }, check: async () => fakeCalendar('2026-12-05') };
+  const browser = { selectSlot: async () => {}, selectDate: async () => { selected++; }, check: async () => fakeCalendar('2026-12-05') };
   await assert.rejects(scanRange(browser, settings, { signal: controller.signal, delay: async () => controller.abort() }), { code: 'scan_cancelled' });
   assert.equal(selected, 1);
 });
 
 test('failed range preserves the previous full snapshot and alert history', async () => {
-  const browser = { selectDate: async () => { throw new AppError('session_expired', 'Login required.'); } };
+  const browser = { selectSlot: async () => {}, selectDate: async () => { throw new AppError('session_expired', 'Login required.'); } };
   const monitor = new Monitor(browser, settings);
   const previous = { matches: [{ date: '2026-12-04', time: '08:30' }] };
   monitor.result = previous; monitor.previous.add('known-slot');
@@ -63,12 +63,13 @@ test('failed range preserves the previous full snapshot and alert history', asyn
   assert.equal(monitor.running, false); assert.equal(monitor.lastError.code, 'session_expired');
 });
 
-test('watch pauses on the matching week, keeps the browser open, and next skips it', async () => {
+test('watch opens the earliest match, keeps the browser open, and next returns before skipping the week', async () => {
   let target;
   let focused = 0;
   const selected = [];
-  const browser = {
+  const browser = { selectSlot: async () => {},
     selectDate: async date => { target = date; selected.push(date); },
+    returnToCalendar: async () => { selected.push('back'); },
     check: async () => fakeCalendar(target), focus: async () => { focused++; },
     close: async () => assert.fail('The browser must stay open for manual booking'),
   };
@@ -79,11 +80,11 @@ test('watch pauses on the matching week, keeps the browser open, and next skips 
   assert.deepEqual(selected, ['2026-12-05']);
   assert.equal(monitor.result.scanComplete, false); assert.equal(monitor.result.weeksChecked, 1);
   await monitor.continueAfterMatch();
-  assert.deepEqual(selected, ['2026-12-05', '2026-12-12']);
+  assert.deepEqual(selected, ['2026-12-05', 'back', '2026-12-12']);
   assert.ok(monitor.skippedWeeks.has('2026-11-30'));
   assert.equal(monitor.waitingForBooking, true); assert.equal(focused, 2);
   await monitor.continueAfterMatch();
-  assert.equal(selected.length, 2); assert.equal(monitor.running, true);
+  assert.equal(selected.length, 4); assert.equal(monitor.running, true);
   assert.equal(monitor.waitingForBooking, false); assert.equal(monitor.result.weeksChecked, 0);
   assert.equal(monitor.result.skippedWeeks.length, 2);
   monitor.stop();
@@ -93,7 +94,7 @@ test('restart clears rejected weeks and rechecks from the start', async () => {
   let target;
   let prepared = 0;
   const selected = [];
-  const browser = {
+  const browser = { selectSlot: async () => {},
     prepare: async () => { prepared++; return { message: 'Ready.' }; },
     selectDate: async date => { target = date; selected.push(date); }, check: async () => fakeCalendar(target),
   };
@@ -110,7 +111,7 @@ test('restart clears rejected weeks and rechecks from the start', async () => {
 test('only slots matching date/time filters pause the scan', async () => {
   let target;
   const selected = [];
-  const browser = { selectDate: async date => { target = date; selected.push(date); }, check: async () => {
+  const browser = { selectSlot: async () => {}, selectDate: async date => { target = date; selected.push(date); }, check: async () => {
     const value = fakeCalendar(target);
     if (target === '2026-12-05') for (const slot of value.slots) slot.time = '06:00';
     return value;
@@ -122,7 +123,7 @@ test('only slots matching date/time filters pause the scan', async () => {
 
 test('once scans all weeks even when pause-on-match is configured', async () => {
   let target;
-  const browser = { selectDate: async date => { target = date; }, check: async () => fakeCalendar(target) };
+  const browser = { selectSlot: async () => {}, selectDate: async date => { target = date; }, check: async () => fakeCalendar(target) };
   const monitor = new Monitor(browser, { ...settings, scanDelaySeconds: 0 });
   await monitor.check();
   assert.equal(monitor.result.weeksChecked, 2); assert.equal(monitor.result.matches.length, 7);
@@ -130,7 +131,7 @@ test('once scans all weeks even when pause-on-match is configured', async () => 
 });
 
 test('single-day ranges pause on matching slots and can opt out', async () => {
-  const browser = { selectDate: async () => {}, check: async () => fakeCalendar('2026-12-05') };
+  const browser = { selectSlot: async () => {}, selectDate: async () => {}, check: async () => fakeCalendar('2026-12-05') };
   const singleDay = { ...settings, dateTo: settings.dateFrom };
   const paused = new Monitor(browser, singleDay);
   await paused.start(); assert.equal(paused.waitingForBooking, true); assert.equal(paused.nextCheck, null);

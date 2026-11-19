@@ -15,7 +15,7 @@ export function validateSettings(input) {
   if (!['1', '2', '3', '4', '7'].includes(value.centre)) bad('Select a valid exam centre.');
   if (typeof value.category !== 'string' || !value.category.trim() || value.category.length > 20) bad('Enter the licence category as shown in RTD.');
   value.category = value.category.trim();
-  if (!Number.isInteger(value.intervalSeconds) || value.intervalSeconds < 60 || value.intervalSeconds > 3600) bad('The check interval must be between 60 and 3600 seconds.');
+  if (!Number.isInteger(value.intervalSeconds) || value.intervalSeconds < 10 || value.intervalSeconds > 3600) bad('The check interval must be between 10 and 3600 seconds.');
   for (const key of ['dateFrom', 'dateTo']) {
     if (typeof value[key] !== 'string') bad('Invalid date.');
     if (value[key] && (!/^\d{4}-\d{2}-\d{2}$/.test(value[key]) || !Number.isFinite(Date.parse(value[key])) || new Date(value[key]).toISOString().slice(0, 10) !== value[key])) bad('Invalid date.');

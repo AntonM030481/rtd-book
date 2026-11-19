@@ -9,13 +9,13 @@ const dates = { RTD_DATE_FROM: '2026-12-04', RTD_DATE_TO: '2026-12-31' };
 const validSettings = { ...defaults, dateFrom: dates.RTD_DATE_FROM, dateTo: dates.RTD_DATE_TO };
 
 test('all launch settings are read from env', () => {
-  const launch = launchConfig({ RTD_MODE: 'watch', RTD_CENTRE: '2', RTD_CATEGORY: 'BB', RTD_DATE_FROM: '2026-12-01', RTD_DATE_TO: '2026-12-31', RTD_TIME_FROM: '08:00', RTD_TIME_TO: '12:00', RTD_INTERVAL_SECONDS: '300' });
+  const launch = launchConfig({ RTD_MODE: 'watch', RTD_CENTRE: '2', RTD_CATEGORY: 'BB', RTD_DATE_FROM: '2026-12-01', RTD_DATE_TO: '2026-12-31', RTD_TIME_FROM: '08:00', RTD_TIME_TO: '12:00', RTD_INTERVAL_SECONDS: '10' });
   assert.equal(launch.mode, 'watch');
-  assert.deepEqual(launch.settings, { ...defaults, centre: '2', category: 'BB', intervalSeconds: 300, dateFrom: '2026-12-01', dateTo: '2026-12-31', timeFrom: '08:00', timeTo: '12:00' });
+  assert.deepEqual(launch.settings, { ...defaults, centre: '2', category: 'BB', intervalSeconds: 10, dateFrom: '2026-12-01', dateTo: '2026-12-31', timeFrom: '08:00', timeTo: '12:00' });
 });
 test('invalid modes, target dates and filters are rejected', () => {
   for (const env of [{ RTD_MODE: 'wrong' }, { RTD_DATE_FROM: '2026-02-31' }]) assert.throws(() => launchConfig({ ...dates, ...env }), { code: 'invalid_settings' });
-  for (const change of [{ intervalSeconds: 1 }, { intervalSeconds: NaN }, { timeFrom: '25:00' }, { timeFrom: '15:00', timeTo: '12:00' }, { dateFrom: '2026-02-31' }, { dateFrom: '2026-12-12', dateTo: '2026-12-01' }, { centre: '999' }]) assert.throws(() => validateSettings({ ...validSettings, ...change }), { code: 'invalid_settings' });
+  for (const change of [{ intervalSeconds: 9 }, { intervalSeconds: NaN }, { timeFrom: '25:00' }, { timeFrom: '15:00', timeTo: '12:00' }, { dateFrom: '2026-02-31' }, { dateFrom: '2026-12-12', dateTo: '2026-12-01' }, { centre: '999' }]) assert.throws(() => validateSettings({ ...validSettings, ...change }), { code: 'invalid_settings' });
 });
 test('config does not open browser or print supplied secrets', () => {
   const sentinels = ['SENTINEL_USER', 'SENTINEL_PASSWORD', 'SENTINEL_PLATE'];

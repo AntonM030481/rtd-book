@@ -3,6 +3,24 @@ import { AppError } from './errors.js';
 
 function fail(message) { throw new AppError('unexpected_response', message); }
 
+function observedSlotLink(cell, date, time, form) {
+  const links = cell.querySelectorAll('a[href]');
+  if (links.length !== 1) return false;
+  try {
+    const url = new URL(links[0].getAttribute('href'), 'https://rtd.mcw.gov.cy/WebPhase1/gui/dlcalendar/');
+    const centres = [...form.querySelectorAll('[name="h_centre"]')].map(el => el.getAttribute('value'));
+    const category = form.querySelector('[name="licencecategory"]')?.getAttribute('value');
+    const matches = url.origin === 'https://rtd.mcw.gov.cy'
+      && url.pathname === '/WebPhase1/gui/dlcalendar/NewCalendar3.jsp'
+      && ['calendarday', 'examtime', 'h_centre', 'licencecategory'].every(key => url.searchParams.getAll(key).length === 1)
+      && isoDate(url.searchParams.get('calendarday') || '') === date
+      && (url.searchParams.get('examtime') || '').trim().padStart(5, '0') === time
+      && centres.length > 0 && centres.every(centre => centre && centre === url.searchParams.get('h_centre'))
+      && Boolean(category) && category === url.searchParams.get('licencecategory');
+    return matches ? links[0].getAttribute('href') : null;
+  } catch { return false; }
+}
+
 export function isoDate(value) {
   const match = /^(\d{2})\/(\d{2})\/(\d{2}|\d{4})$/.exec(value);
   if (!match) return null;
@@ -62,12 +80,15 @@ export function parseCalendar(html, { expectedDate, status = 200 } = {}) {
       const time = cell.textContent.trim().padStart(5, '0');
       if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(time)) fail('An invalid time was found in the calendar.');
       const background = cell.getAttribute('background').split('/').pop().toLowerCase();
+      const selectionHref = ['timeregular3.gif', 'bluetimeover.gif', 'greentime.gif'].includes(background)
+        ? observedSlotLink(cell, dates[index], time, form) : null;
       const availability = background === 'redtime.gif' ? 'unavailable'
-        : background === 'greentime.gif' ? 'available' : 'unknown';
-      // Blue/overtime markup has not been verified live. Never infer a bookable
-      // slot merely because it is not red, or trust a link without its semantics.
+        : background === 'greentime.gif' || selectionHref ? 'available' : 'unknown';
+      // Both regular and overtime links were observed live on 2026-11-19.
+      // Preserve the site's exact link; never construct a selection endpoint.
       slots.push({ date: dates[index], time, availability, background,
-        hasAction: Boolean(cell.querySelector('a, input, button') || cell.hasAttribute('onclick')) });
+        hasAction: Boolean(cell.querySelector('a, input, button') || cell.hasAttribute('onclick')),
+        ...(selectionHref ? { selectionHref, overtime: background === 'bluetimeover.gif' } : {}) });
     }
   }
   if (!dates || !slots.length) fail('The weekly calendar was not recognized. Availability is unknown.');

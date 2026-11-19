@@ -130,3 +130,43 @@ test('a long Retry-After does not overflow the timer into an early request', asy
   assert.equal(monitor.running, true);
   assert.equal(Date.parse(monitor.nextCheck), 1000000 + 2592000000);
 });
+
+test('watch selects the earliest date/time, then hands over without another scan', async () => {
+  const settingsWithTwoDays = { ...settings, dateTo: '2026-12-05' };
+  const selected = [];
+  const monitor = new Monitor({ selectDate: async () => {}, check: async () => response([
+    { ...slot, date: '2026-12-05', time: '07:45' }, { ...slot, time: '17:30' }, { ...slot, time: '13:45', overtime: true },
+  ]), selectSlot: async s => selected.push(s) }, settingsWithTwoDays);
+  await monitor.start();
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].date, '2026-12-04'); assert.equal(selected[0].time, '13:45');
+  assert.equal(monitor.result.handoff.status, 'ready');
+  assert.equal(monitor.running, false); assert.equal(monitor.waitingForBooking, true); assert.equal(monitor.nextCheck, null);
+});
+
+for (const error of [httpError(429, '900'), new AppError('handoff_failed', 'Unexpected response'), new Error('timeout')]) {
+  test(`handoff ${error.code || 'timeout'} leaves browser open and never schedules a retry`, async () => {
+    let selections = 0;
+    const monitor = new Monitor({ selectDate: async () => {}, check: async () => response([slot]),
+      selectSlot: async () => { selections++; throw error; }, close: async () => assert.fail('Browser must remain open'),
+    }, settings);
+    await monitor.start();
+    assert.equal(selections, 1); assert.equal(monitor.result.handoff.status, 'failed');
+    assert.equal(monitor.running, false); assert.equal(monitor.waitingForBooking, true); assert.equal(monitor.nextCheck, null);
+    if (error.code === 'rate_limited') {
+      await assert.rejects(monitor.continueAfterMatch(), { code: 'cooldown' });
+      await assert.rejects(monitor.restart(), { code: 'cooldown' });
+    }
+  });
+}
+
+test('stop during handoff prevents both a success report and further work', async () => {
+  let finish, reached;
+  const ready = new Promise(resolve => { reached = resolve; });
+  const monitor = new Monitor({ selectDate: async () => {}, check: async () => response([slot]),
+    selectSlot: async () => { reached(); await new Promise(resolve => { finish = resolve; }); },
+  }, settings);
+  const running = monitor.start();await ready;monitor.stop();finish();await running;
+  assert.equal(monitor.waitingForBooking, false);assert.equal(monitor.running, false);assert.equal(monitor.nextCheck, null);
+  assert.notEqual(monitor.result.handoff.status, 'ready');
+});

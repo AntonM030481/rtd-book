@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { RtdBrowser } from '../src/browser.js';
 import { defaults } from '../src/settings.js';
-import { calendar } from './fixtures.js';
+import { calendar, observedCalendar } from './fixtures.js';
 
 let chrome;
 before(async () => { chrome = await chromium.launch({ channel: 'chrome', headless: true }); });
@@ -99,3 +99,92 @@ for (const [status, code] of [[429, 'rate_limited'], [403, 'access_denied'], [40
     assert.equal(requests.length, count);
   });
 }
+
+const observedCalendarUrl = `${origin}/WebPhase1/gui/dlcalendar/NewCalendar1.jsp`;
+async function selectionHarness(t, { background = 'bluetimeover.gif', status = 200, change = html => html } = {}) {
+  const context = await chrome.newContext({ serviceWorkers: 'block' });
+  context.setDefaultTimeout(2000);
+  t.after(() => context.close());
+  const browser = new RtdBrowser();
+  browser.context = context;
+  context.on('response', r => browser.observeResponse(r));
+  const requests = [];
+  await context.route('**/*', async route => {
+    const req = route.request();
+    requests.push({ method: req.method(), path: new URL(req.url()).pathname });
+    if (req.url() === `${origin}/selection-test`) return route.fulfill({ contentType: 'text/html', body: `<iframe name="center" src="${observedCalendarUrl}"></iframe>` });
+    if (req.url() === observedCalendarUrl) return route.fulfill({ contentType: 'text/html; charset=utf-8', body: observedCalendar(background) });
+    if (new URL(req.url()).pathname === '/WebPhase1/gui/dlcalendar/NewCalendar3.jsp') {
+      return route.fulfill({ status, headers: status === 429 ? { 'retry-after': '900' } : {}, contentType: 'text/html; charset=utf-8', body: change(`<form name="vrmSearch" method="post" action="../../ProcessOnlineTestPayment?lang=null">
+        <input type="hidden" name="h_centre" value="1"><input type="hidden" name="licencecategory" value="ΒΒ">
+        <input type="hidden" name="h_test_date" value="04/12/26"><input type="hidden" name="h_test_time" value="13:45">
+        <div class="g-recaptcha" onclick="window.captchaClicked=true"></div>
+        <input id="submitBtn" type="button" value="Payment" disabled onclick="this.form.submit()">
+      </form>`) });
+    }
+    return route.abort();
+  });
+  browser.page = await context.newPage();
+  await browser.page.goto(`${origin}/selection-test`);
+  const settings = { ...defaults, dateFrom: '2026-12-04', dateTo: '2026-12-31' };
+  const slot = (await browser.check(settings)).slots.find(s => s.availability === 'available');
+  return { browser, requests, settings, slot };
+}
+
+for (const background of ['timeregular3.gif', 'bluetimeover.gif']) {
+  test(`${background}: one selection GET then stop; next restores calendar without a payment request`, async t => {
+    const { browser, requests, settings, slot } = await selectionHarness(t, { background });
+    const before = requests.length;
+    await browser.selectSlot(slot, settings);
+    assert.equal(requests.length, before + 1);
+    assert.equal(requests.at(-1).method, 'GET');
+    const frame = browser.selection.frame;
+    assert.equal(await frame.locator('#submitBtn').isDisabled(), true);
+    assert.equal(await frame.evaluate(() => Boolean(window.captchaClicked)), false);
+    await browser.returnToCalendar(settings);
+    assert.equal((await browser.check(settings)).available, 1);
+    assert.equal(browser.selection, null);
+    assert.equal(requests.some(r => r.path.includes('ProcessOnlineTestPayment')), false);
+  });
+}
+
+test('already enabled payment button is never clicked', async t => {
+  const { browser, requests, settings, slot } = await selectionHarness(t, { change: html => html.replace(' disabled', '') });
+  await browser.selectSlot(slot, settings);
+  assert.equal(await browser.selection.frame.locator('#submitBtn').isDisabled(), false);
+  assert.equal(requests.some(r => r.method === 'POST'), false);
+});
+
+test('changed slot and cancellation stop before the selection request', async t => {
+  const { browser, requests, settings, slot } = await selectionHarness(t);
+  const before = requests.length;
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(browser.selectSlot(slot, settings, { signal: controller.signal }), { code: 'scan_cancelled' });
+  const frame = await browser.findFrame('form[name="vrmSearch"]');
+  await frame.locator('td[background$="bluetimeover.gif"] a').evaluate(a => a.removeAttribute('href'));
+  await assert.rejects(browser.selectSlot(slot, settings), { code: 'slot_changed' });
+  assert.equal(requests.length, before);
+});
+
+for (const [label, change] of [
+  ['date', html => html.replace('04/12/26', '05/12/26')],
+  ['centre', html => html.replace('name="h_centre" value="1"', 'name="h_centre" value="2"')],
+  ['category', html => html.replace('value="ΒΒ"', 'value="A"')],
+  ['time', html => html.replace('13:45', '14:30')],
+  ['form action', html => html.replace('ProcessOnlineTestPayment', 'OtherServlet')],
+  ['missing CAPTCHA', html => html.replace('g-recaptcha', 'other-widget')],
+]) {
+  test(`mismatching ${label} on the next screen cannot count as a successful handoff`, async t => {
+    const { browser, requests, settings, slot } = await selectionHarness(t, { change });
+    await assert.rejects(browser.selectSlot(slot, settings), { code: 'handoff_failed' });
+    assert.equal(requests.filter(r => r.path.endsWith('NewCalendar3.jsp')).length, 1);
+    assert.equal(requests.some(r => r.method === 'POST'), false);
+  });
+}
+
+test('selection HTTP 429 is not retained for calendar replay', async t => {
+  const { browser, requests, settings, slot } = await selectionHarness(t, { status: 429 });
+  await assert.rejects(browser.selectSlot(slot, settings), { code: 'rate_limited' });
+  assert.equal(browser.calendarRetry, null);
+  assert.equal(requests.filter(r => r.path.endsWith('NewCalendar3.jsp')).length, 1);
+});

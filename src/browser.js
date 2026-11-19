@@ -2,7 +2,7 @@ import { chromium } from 'playwright';
 import { join } from 'node:path';
 import { config, root } from './config.js';
 import { AppError, httpError } from './errors.js';
-import { isoDate, parseCalendar } from './parser.js';
+import { filterSlots, isoDate, parseCalendar } from './parser.js';
 
 const origin = 'https://rtd.mcw.gov.cy';
 const entry = `${origin}/WebPhase1/gui/Common/LoginFrameGreek.jsp?lang=en`;
@@ -14,6 +14,7 @@ export class RtdBrowser {
   accessError = null;
   calendarRetry = null;
   lastAccessResponse = null;
+  selection = null;
 
   observeResponse(response) {
     // Observe existing document traffic only; never issue a diagnostic request.
@@ -140,6 +141,7 @@ export class RtdBrowser {
 
   async prepare(settings) {
     await this.open();
+    await this.returnToCalendar(settings);
     // A single credential submission per explicit prepare action. Never retry
     // a rejected login in the monitoring loop.
     const passwordFrame = await this.waitForLoginOrAccount();
@@ -307,6 +309,88 @@ export class RtdBrowser {
           .some(cell => !cell.querySelector('table') && cell.textContent.trim().endsWith(shortDate));
       }, { fullDate, shortDate }, { timeout: 15000 });
     } catch { throw new AppError('week_mismatch', 'The selected week did not load. Check the RTD window.'); }
+  }
+
+  async selectSlot(slot, settings, { signal } = {}) {
+    const cancelled = () => { if (signal?.aborted) throw new AppError('scan_cancelled', 'Selection stopped.'); };
+    cancelled();
+    // Re-read the visible document, without refreshing it or making a fetch.
+    const calendar = await this.check(settings);
+    const current = filterSlots(calendar.slots, settings).find(item => item.date === slot.date && item.time === slot.time);
+    if (!current?.selectionHref || current.selectionHref !== slot.selectionHref) {
+      throw new AppError('slot_changed', 'The matching slot no longer has the verified selection link. Check the RTD window.');
+    }
+    const frame = await this.findFrame('form[name="vrmSearch"]');
+    const link = frame.locator(`td[background] a[href=${JSON.stringify(current.selectionHref)}]`);
+    if (await link.count() !== 1) throw new AppError('slot_changed', 'The slot link is no longer unique. Check the RTD window.');
+    const target = await link.getAttribute('target');
+    if (target && target !== '_self' && target !== frame.name()) {
+      throw new AppError('unexpected_action', 'The slot targets an unfamiliar browser frame. No selection was made.');
+    }
+    const detailUrl = new URL(current.selectionHref, frame.url()).href;
+    if (new URL(detailUrl).origin !== origin || new URL(detailUrl).pathname !== '/WebPhase1/gui/dlcalendar/NewCalendar3.jsp'
+      || await link.evaluate(anchor => anchor.href) !== detailUrl) {
+      throw new AppError('unexpected_action', 'The slot link resolves outside the observed selection page.');
+    }
+    cancelled();
+    this.selection = { frame, calendarUrl: frame.url(), detailUrl };
+    let response;
+    try {
+      [response] = await Promise.all([
+        frame.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
+        link.click({ noWaitAfter: true }),
+      ]);
+    } catch {
+      cancelled();
+      this.assertAccess();
+      throw new AppError('handoff_failed', 'The selected slot page did not finish loading. No retry was made; inspect the browser.');
+    }
+    cancelled();
+    this.assertAccess();
+    if (!response) throw new AppError('handoff_failed', 'No response to slot selection. Inspect the browser before any further action.');
+    const error = httpError(response.status(), response.headers()['retry-after'] || '');
+    if (error) throw error;
+    const details = await frame.evaluate(() => {
+      const form = document.forms.namedItem('vrmSearch');
+      const button = document.querySelector('#submitBtn');
+      if (!form || !button || button.form !== form) return null;
+      const data = new FormData(form);
+      const value = key => data.getAll(key).length === 1 ? String(data.get(key)) : '';
+      return { action: form.action, method: form.method, centre: value('h_centre'), category: value('licencecategory'),
+        date: value('h_test_date'), time: value('h_test_time'), buttonType: button.type,
+        captchaPresent: Boolean(document.querySelector('.g-recaptcha, iframe[title="reCAPTCHA"], [name="g-recaptcha-response"]')) };
+    });
+    const action = details && new URL(details.action);
+    if (frame.url() !== detailUrl || !details || !await frame.locator('#submitBtn').isVisible()
+      || action.origin !== origin || action.pathname !== '/WebPhase1/ProcessOnlineTestPayment'
+      || details.method.toLowerCase() !== 'post' || details.buttonType !== 'button' || !details.captchaPresent
+      || details.centre !== settings.centre || categoryKey(details.category) !== categoryKey(settings.category)
+      || isoDate(details.date) !== slot.date || details.time.trim().padStart(5, '0') !== slot.time) {
+      throw new AppError('handoff_failed', 'The next page does not confirm the selected exam and expected CAPTCHA/payment form. Inspect it manually; no further action was taken.');
+    }
+    // End of automation. Never inspect a CAPTCHA token, click its checkbox,
+    // enable the payment button, or submit the payment form.
+    return { date: slot.date, time: slot.time, centre: settings.centre, category: settings.category };
+  }
+
+  async returnToCalendar(settings) {
+    if (!this.selection) return;
+    const { frame, calendarUrl, detailUrl } = this.selection;
+    this.assertAccess();
+    if (frame.isDetached() || ![calendarUrl, detailUrl].includes(frame.url())) {
+      throw new AppError('manual_step', 'The page changed after slot selection. Check RTD manually before restarting the monitor.');
+    }
+    if (frame.url() === detailUrl) {
+      // Only an explicit next/restart command returns through browser history.
+      // It never resubmits the selection or payment form.
+      await Promise.all([
+        frame.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 20000 }),
+        frame.evaluate(() => history.back()),
+      ]);
+    }
+    if (frame.url() !== calendarUrl) throw new AppError('manual_step', 'The previous calendar could not be restored. Check the RTD window.');
+    await this.check(settings);
+    this.selection = null;
   }
 
   async focus() { if (this.page && !this.page.isClosed()) await this.page.bringToFront(); }

@@ -11,7 +11,7 @@ const help = `RTD Book - local console monitor
 Usage:
   npm start                     use RTD_MODE from .env (default: once)
   npm start -- --mode once       check availability, print results and exit
-  npm start -- --mode watch      repeat checks until Ctrl+C
+  npm start -- --mode watch      scan, open the first match, stop for CAPTCHA/payment
   npm start -- --config          show configuration, without contacting RTD
   npm start -- --help            show help
 
@@ -30,8 +30,8 @@ Settings:
   RTD_TIME_TO=18:00
   RTD_INTERVAL_SECONDS=120       pause after a full monitoring cycle
   RTD_SCAN_DELAY_SECONDS=2       pause between weeks (1-30 seconds)
-  RTD_PAUSE_ON_MATCH=true        in watch mode, stop at a matching week and
-                                keep the RTD browser open for manual booking
+  RTD_PAUSE_ON_MATCH=true        in watch mode, select the earliest matching slot
+                                and stop at the CAPTCHA/payment page
   RTD_BROWSER_CHANNEL=chrome
 
 Range scans cover the selected centre, at most 366 days per run.
@@ -58,11 +58,13 @@ function printResult(result, fresh) {
   console.log(`  Centre: ${result.centre} | category: ${result.category}`);
   if (result.afterWeek) console.log(`  This pass covers only weeks after ${result.afterWeek}.`);
   if (result.skippedWeeks?.length) console.log(`  Weeks excluded by you until restart: ${result.skippedWeeks.join(', ')}`);
-  console.log(`  Green: ${result.available}; unavailable: ${result.unavailable}; unknown: ${result.unknown}`);
+  console.log(`  Available: ${result.available}; unavailable: ${result.unavailable}; unknown: ${result.unknown}`);
   if (result.matches.length) {
     console.log('  Date         Time    Status');
-    for (const slot of result.matches) console.log(`  ${slot.date}   ${slot.time}   available according to RTD markup`);
-    console.log('  Open RTD to verify availability and book.');
+    for (const slot of result.matches) console.log(`  ${slot.date}   ${slot.time}   available according to RTD markup${slot.overtime ? ' (overtime, additional fee)' : ''}`);
+    if (result.handoff?.status === 'ready') console.log('  CAPTCHA/payment page ready. Complete verification and payment yourself.');
+    else if (result.handoff?.status === 'failed') console.log('  Automatic selection was not confirmed. Inspect the open RTD browser.');
+    else console.log('  Open RTD to verify availability and book.');
     if (fresh) { console.log(`  New matching slots: ${fresh}`); if (process.stdout.isTTY) process.stdout.write('\x07'); }
   }
   if (result.warning) console.log(`  ${result.warning}`);
