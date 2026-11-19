@@ -40,6 +40,8 @@ No booking, payment, cancellation or rescheduling. All times are Cyprus time.
 When watch mode pauses on a match: next/n skips that week; restart/r clears
 skipped weeks and restarts the full scan with the same settings; quit/q or
 Ctrl+C exits and closes the app browser. No startup menu or prompt.
+On preparation or scan errors, the browser stays open for manual work.
+Use restart/r to retry explicitly, or quit/q to close the browser and exit.
 `;
 
 export function commandOptions(args) {
@@ -101,41 +103,58 @@ async function main() {
   };
   process.once('SIGINT', () => { void close(); });
   process.once('SIGTERM', () => { void close(); });
+  const finishOnce = async () => {
+    await monitor.check();
+    if (closing) return;
+    process.exitCode = monitor.lastError || monitor.result?.status === 'partial' ? 1 : 0;
+    if (monitor.lastError) enableCommands();
+    else await close();
+  };
+  const enableCommands = () => {
+    if (commands || closing) return;
+    commands = createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY) });
+    commands.on('SIGINT', () => { void close(); });
+    commands.on('line', async text => {
+      const command = text.trim().toLowerCase();
+      if (command === 'q' || command === 'quit') { await close(); return; }
+      if (['n', 'next', 'r', 'restart'].includes(command)) {
+        if (controlBusy || monitor.busy) { console.log('Wait for the current operation, or use quit/q.'); return; }
+        controlBusy = true;
+        try {
+          if (command === 'r' || command === 'restart') {
+            if (launch.mode === 'watch') await monitor.restart();
+            else { await monitor.prepare(); if (!closing) await finishOnce(); }
+          } else if (launch.mode === 'watch') await monitor.continueAfterMatch();
+          else console.log('Use restart/r to repeat the one-time scan, or quit/q to exit.');
+        } catch (error) {
+          if (!closing) console.error(publicError(error).message);
+        } finally { controlBusy = false; }
+      } else if (command) console.log('While paused: next/n (matching week), restart/r, quit/q.');
+    });
+    let reportedError = null;
+    keeper = setInterval(() => {
+      if (!closing && !controlBusy && !monitor.busy && !monitor.running && !monitor.waitingForBooking
+        && monitor.lastError && reportedError !== monitor.lastError) {
+        reportedError = monitor.lastError;
+        console.log('Automation paused. The browser stays open for manual work. Use restart/r to retry, or quit/q to close and exit.');
+      }
+    }, 500);
+  };
+  if (launch.mode === 'watch') enableCommands();
   try {
     console.log(`Mode: ${launch.mode}; range: ${launch.settings.dateFrom} - ${launch.settings.dateTo}; centre: ${launch.settings.centre}`);
     await monitor.prepare();
     if (closing) return;
     if (launch.mode === 'once') {
-      await monitor.check();
-      if (monitor.lastError || monitor.result?.status === 'partial') process.exitCode = 1;
-      await close();
+      await finishOnce();
     } else {
-      commands = createInterface({ input: process.stdin, output: process.stdout, terminal: Boolean(process.stdin.isTTY && process.stdout.isTTY) });
-      commands.on('SIGINT', () => { void close(); });
-      commands.on('line', async text => {
-        const command = text.trim().toLowerCase();
-        if (command === 'q' || command === 'quit') { await close(); return; }
-        if (['n', 'next', 'r', 'restart'].includes(command)) {
-          if (controlBusy) { console.log('Wait for the current command, or use quit/q.'); return; }
-          controlBusy = true;
-          try {
-            if (command === 'r' || command === 'restart') await monitor.restart();
-            else await monitor.continueAfterMatch();
-          } catch (error) { console.error(publicError(error).message); }
-          finally { controlBusy = false; }
-        } else if (command) console.log('While paused: next/n, restart/r, quit/q.');
-      });
       await monitor.start();
       if (closing) return;
-      if (!monitor.running && !monitor.waitingForBooking) { process.exitCode = 1; await close(); return; }
-      if (!monitor.waitingForBooking) console.log('Monitoring. Press Ctrl+C to stop.');
-      keeper = setInterval(() => {
-        if (!controlBusy && !monitor.running && !monitor.waitingForBooking) { process.exitCode = monitor.lastError ? 1 : 0; void close(); }
-      }, 500);
+      if (monitor.running) console.log('Monitoring. Press Ctrl+C to stop.');
     }
   } catch (error) {
     if (!closing) { if (monitor.lastError?.message !== publicError(error).message) console.error(publicError(error).message); process.exitCode = 1; }
-    await close();
+    enableCommands();
   }
 }
 
