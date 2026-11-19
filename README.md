@@ -54,6 +54,8 @@ The app opens a separate Chrome window, makes at most one login attempt, fills t
 
 Navigation selects a Saturday to load each Monday–Saturday week, including weeks crossing month/year boundaries. Only slots inside the requested bounds are returned. This may navigate to a day just outside the range to load its last week. The app waits for actual frame navigation and verifies the returned week, rather than trusting a date field that updates before the table.
 
+Month navigation recognizes English and Greek headings, including month/year in separate table cells or without a separating space. It waits up to five seconds for the heading to render, using local DOM reads only. Conflicting month headings stop navigation rather than guessing. The displayed month is read from the calendar, not inferred from the previously selected date.
+
 Availability is read directly from that loaded document. There is no second `fetch` or background calendar POST: each scanned week needs one calendar navigation, and the displayed table is the one being checked. In watch mode, a matching slot is selected from this document without an extra calendar refresh or login. Other page resources and initial login/setup may still make requests.
 
 ## Manual booking during monitoring

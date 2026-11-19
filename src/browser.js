@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { config, root } from './config.js';
 import { AppError, httpError } from './errors.js';
 import { filterSlots, isoDate, parseCalendar } from './parser.js';
+import { readCalendarMonth } from './calendar-month.js';
 
 const origin = 'https://rtd.mcw.gov.cy';
 const entry = `${origin}/WebPhase1/gui/Common/LoginFrameGreek.jsp?lang=en`;
@@ -261,19 +262,20 @@ export class RtdBrowser {
     if (!frame) throw new AppError('calendar_missing', 'The weekly calendar must be open before selecting a date.');
     const target = new Date(`${date}T00:00:00Z`);
     if (target.getUTCDay() === 0) throw new AppError('invalid_date', 'RTD displays Monday through Saturday. Select one of those days.');
-    const monthNames = ['ιανουαριος', 'φεβρουαριος', 'μαρτιος', 'απριλιος', 'μαιος', 'ιουνιος', 'ιουλιος', 'αυγουστος', 'σεπτεμβριος', 'οκτωβριος', 'νοεμβριος', 'δεκεμβριος'];
     const targetMonth = target.getUTCFullYear() * 12 + target.getUTCMonth();
-    const readMonth = () => frame.evaluate(names => {
-      for (const cell of document.querySelectorAll('td,th')) {
-        if (cell.querySelector('table')) continue;
-        const text = cell.textContent.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
-        const match = /^([α-ω]+)\s+(\d{4})$/.exec(text);
-        if (match && names.includes(match[1])) return Number(match[2]) * 12 + names.indexOf(match[1]);
-      }
-      return null;
-    }, monthNames);
-    let currentMonth = await readMonth();
-    if (currentMonth === null || Math.abs(currentMonth - targetMonth) > 24) throw new AppError('manual_step', 'Could not select the month automatically. Select the date in the RTD window.');
+    const readMonth = () => frame.evaluate(readCalendarMonth);
+    let currentMonth;
+    try {
+      // The form can exist before the calendar heading is rendered. Poll only
+      // the local DOM; this does not refresh RTD or make additional requests.
+      const month = await frame.waitForFunction(readCalendarMonth, undefined, { timeout: 5000 });
+      try { currentMonth = await month.jsonValue(); }
+      finally { await month.dispose(); }
+    } catch {
+      this.assertAccess();
+      throw new AppError('manual_step', 'The displayed calendar month could not be recognized in English or Greek. Inspect the open RTD calendar, then use restart/r.');
+    }
+    if (Math.abs(currentMonth - targetMonth) > 24) throw new AppError('manual_step', 'The requested date is more than 24 months from the displayed month. Select a closer month in RTD, then use restart/r.');
     while (currentMonth !== targetMonth) {
       const next = targetMonth > currentMonth;
       await frame.locator(`img[src$="dlcalendar_${next ? 'next' : 'prev'}month_black.gif"]`).click();
@@ -281,7 +283,7 @@ export class RtdBrowser {
       const deadline = Date.now() + 5000;
       do {
         currentMonth = await readMonth();
-        if (currentMonth !== previous) break;
+        if (currentMonth !== null && currentMonth !== previous) break;
         await new Promise(resolve => setTimeout(resolve, 100));
       } while (Date.now() < deadline);
       if (currentMonth === null || currentMonth !== previous + (next ? 1 : -1)) throw new AppError('manual_step', 'The month change was not confirmed. Check the RTD calendar.');

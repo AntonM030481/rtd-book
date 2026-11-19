@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/cli.js",
     "test": "node --test test/*.test.js",
-    "check": "node --check src/cli.js && node --check src/browser.js && node --check src/parser.js && node --check src/monitor.js && node --check src/scan.js"
+    "check": "node --check src/cli.js && node --check src/browser.js && node --check src/calendar-month.js && node --check src/parser.js && node --check src/monitor.js && node --check src/scan.js"
   },
   "dependencies": {
     "linkedom": "0.18.15",
